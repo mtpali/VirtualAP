@@ -1,0 +1,222 @@
+name: VirtualAP CI
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Create an Official GitHub Release?'
+        required: true
+        type: boolean
+        default: false
+      tag_name:
+        description: 'Tag name (Only used if Release is checked)'
+        required: false
+        default: 'test'
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Backend regression checks
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Check shell syntax and status fixtures
+      run: |
+        sh -n backend/start-ap
+        python3 -m unittest discover -s tests -v
+
+  traffic:
+    name: Kernel traffic accounting regression
+    needs: [binaries]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/download-artifact@v4
+      with:
+        name: bin-aarch64
+        path: backend/aarch64
+    - name: Exercise real packet counters with the APK's BusyBox
+      run: |
+        chmod +x backend/aarch64/busybox
+        backend/aarch64/busybox sh -n backend/start-ap
+        sudo env RUN_NETFILTER_TESTS=1 \
+          TEST_FLOCK="$PWD/backend/aarch64/busybox flock" \
+          TEST_SHELL="$PWD/backend/aarch64/busybox sh" \
+          python3 -m unittest discover -s tests -p test_traffic_kernel.py -v
+
+  binaries:
+    name: Static binaries (${{ matrix.arch }})
+    # ARM runners run both the arm64 and the 32-bit arm Alpine containers
+    # natively, so nothing is compiled under emulation.
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      matrix:
+        arch: [aarch64]
+    steps:
+    - uses: actions/checkout@v4
+
+    # The binaries only depend on the three source submodules and the two build
+    # scripts, so most pushes can reuse the previous build.
+    - name: Hash the sources
+      id: src
+      run: echo "hash=$(git ls-tree HEAD externals/ | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+    - name: Restore cached binaries
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: backend/${{ matrix.arch }}
+        key: bin-${{ matrix.arch }}-${{ steps.src.outputs.hash }}-${{ hashFiles('scripts/build-static.sh', 'scripts/build-in-container.sh') }}
+
+    - name: Build static binaries from source
+      if: steps.cache.outputs.cache-hit != 'true'
+      # Compiles hostapd/iw/dnsmasq (+ busybox) in an Alpine container from the
+      # externals/ submodules and stages them into backend/<arch>.
+      run: bash scripts/build-static.sh ${{ matrix.arch }}
+
+    - name: Upload binaries
+      uses: actions/upload-artifact@v4
+      with:
+        name: bin-${{ matrix.arch }}
+        path: backend/${{ matrix.arch }}
+        if-no-files-found: error
+
+  build:
+    name: Build Android App
+    needs: [binaries, checks, traffic]
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Download aarch64 binaries
+      uses: actions/download-artifact@v4
+      with:
+        name: bin-aarch64
+        path: backend/aarch64
+
+    # Artifacts do not keep the executable bit.
+    - name: Restore executable bits
+      run: chmod +x backend/aarch64/*
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+        cache: gradle
+
+    - name: Cache development signing key
+      uses: actions/cache@v4
+      with:
+        path: ci-debug.keystore
+        key: virtualap-development-signing-v1
+
+    - name: Decode Keystore
+      env:
+        RELEASE_KEYSTORE: ${{ secrets.RELEASE_KEYSTORE }}
+      if: ${{ github.event_name != 'pull_request' && env.RELEASE_KEYSTORE != '' }}
+      run: echo "${{ env.RELEASE_KEYSTORE }}" | base64 -d > virtualap.keystore
+
+    - name: Grant execute permission for gradlew
+      run: chmod +x Android/gradlew
+
+    - name: Test and lint Android app
+      run: |
+        cd Android
+        ./gradlew testDebugUnitTest lintRelease -PbackendArches=aarch64
+
+    - name: Build Android App with Gradle
+      env:
+        KEYSTORE_PASSWORD: ${{ github.event_name != 'pull_request' && secrets.KEYSTORE_PASSWORD || '' }}
+        KEY_ALIAS: ${{ github.event_name != 'pull_request' && secrets.KEY_ALIAS || '' }}
+        KEY_PASSWORD: ${{ github.event_name != 'pull_request' && secrets.KEY_PASSWORD || '' }}
+      run: |
+        cd Android
+        ./gradlew assembleRelease -PbackendArches=aarch64 \
+          -PKEYSTORE_PASSWORD="$KEYSTORE_PASSWORD" \
+          -PKEY_ALIAS="$KEY_ALIAS" \
+          -PKEY_PASSWORD="$KEY_PASSWORD"
+
+    - name: Stage & Rename Artifact
+      run: |
+        VERSION=$(cat VERSION)
+        APK_NAME="VirtualAP-v${VERSION}-arm64-v8a.apk"
+        mkdir -p dist
+        mv Android/app/build/outputs/apk/release/app-release.apk dist/${APK_NAME}
+        echo "APK_FILE=dist/${APK_NAME}" >> $GITHUB_ENV
+
+    - name: Upload test reports
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: android-test-reports
+        path: |
+          Android/app/build/reports/tests/
+          Android/app/build/reports/lint-results-release.*
+
+    - name: Upload APK Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: virtualap-apk
+        path: dist/
+
+  release:
+    name: Create GitHub Release
+    needs: [build]
+    if: |
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.create_release == 'true' &&
+      github.event.inputs.tag_name != '' &&
+      github.event.inputs.tag_name != 'test'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Download Artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: virtualap-apk
+        path: release-assets
+
+    - name: Generate Changelog
+      id: changelog
+      run: |
+        PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+        echo "Previous tag: $PREV_TAG"
+
+        if [ -z "$PREV_TAG" ]; then
+          CHANGELOG=$(git log --oneline --pretty=format:"* %s (%h)")
+        else
+          CHANGELOG=$(git log ${PREV_TAG}..HEAD --oneline --pretty=format:"* %s (%h)")
+        fi
+
+        {
+          echo "notes<<EOF"
+          echo "$CHANGELOG"
+          echo "EOF"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ github.event.inputs.tag_name }}
+        name: VirtualAP ${{ github.event.inputs.tag_name || 'Development Build' }}
+        target_commitish: ${{ github.sha }}
+        body: |
+          ## What's Changed
+          ${{ steps.changelog.outputs.notes }}
+
+          ---
+          **Automated Release by VirtualAP CI**
+        files: |
+          release-assets/*.apk
