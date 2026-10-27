@@ -6,17 +6,20 @@ are retained. Source: https://github.com/ravindu644/VirtualAP/tree/v2.0.5.
 
 Changes in this fork:
 
-- Connected devices appear first, with compact per-connection upload + download totals.
-- Uses the real Wi-Fi station byte counters, covering IPv4 and IPv6 without a
-  packet-capture service or extra firewall rules. Missing counters show `Unavailable`.
+- Connected devices appear first, with compact upload + download totals.
+- Routed mode uses independent per-MAC network accounting for forwarded IPv4,
+  so frozen radio counters do not freeze the display. DHCP registers devices
+  even while the app is closed. Other modes retain the radio-counter fallback.
+- Only hostapd-authorized associations establish presence. Empty lists never
+  fall back to stale, broadcast or synthetic driver entries.
 - Displays the advertised DHCP hostname or WPS name/model when present. Android
   and iOS may hide their names; no manufacturer is guessed from a randomized MAC.
 - One always-dark AMOLED theme, English resources only, system fonts and a simple spinner.
 - The supplied white Wi-Fi mark is a centered vector adaptive icon, including
   Android 13 monochrome icons. The original artwork is in `Documentation/artwork/wifi.png`.
 - Settings opens `Telegam : VPN963` in Telegram, with an HTTPS browser fallback.
-- Release builds use R8 and resource shrinking. CI produces universal and smaller
-  ARM64 APKs, plus test and lint reports.
+- Release builds use R8 and resource shrinking. CI produces one
+  ARM64 APK, plus test and lint reports.
 
 See [customization and device validation](Documentation/Customization.md) for scope,
 build instructions and hardware checks. The upstream documentation follows.

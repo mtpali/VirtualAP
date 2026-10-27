@@ -63,7 +63,7 @@
     <string name="connected_devices">Connected devices</string>
     <string name="no_connected_devices">No devices connected</string>
     <string name="start_to_view_devices">Start the hotspot to see connected devices</string>
-    <string name="traffic_scope">Current Wi-Fi connection · upload + download</string>
+    <string name="traffic_scope">Upload + download</string>
     <string name="traffic_unavailable">Unavailable</string>
     <string name="unnamed_device">Device %1$s</string>
     <string name="advanced_show">Advanced settings</string>

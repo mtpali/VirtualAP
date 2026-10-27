@@ -107,6 +107,8 @@ fi
 # across phones). Each $VAR word-splits to "busybox <applet>" - never quote it.
 # ip/iptables stay Android's; iw/hostapd/dnsmasq are our static binaries.
 BB="$BUSYBOX"
+AWK="$BB awk"
+FLOCK="$BB flock"
 CAT="$BB cat"
 CUT="$BB cut"
 DATE="$BB date"
@@ -526,10 +528,137 @@ ttl_apply() {
     return 0
 }
 
+# Keep accounting in mangle so Android's filter ACCEPT rules cannot bypass it.
+# RETURN only leaves our chain; it never accepts, drops or rewrites a packet.
+traffic_ipt() { "$IPT" -w 2 -t mangle "$@"; }
+
+traffic_valid_mac() {
+    case "$1" in
+        00:00:00:00:00:00) return 1 ;;
+        [0-9a-f][02468ace]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+traffic_valid_ip() {
+    $AWK -v ip="$1" 'BEGIN {
+        if (split(ip, p, ".") != 4) exit 1
+        for (i = 1; i <= 4; i++)
+            if (p[i] !~ /^[0-9]+$/ || length(p[i]) > 3 || p[i] + 0 > 255 || (length(p[i]) > 1 && substr(p[i], 1, 1) == "0")) exit 1
+    }'
+}
+
+traffic_init() {
+    [ -f "$RUN_DIR/traffic/ready" ] && return 0
+    (
+        $FLOCK -x 9 || exit 1
+        [ -f "$RUN_DIR/traffic/ready" ] && exit 0
+        $MKDIR -p "$RUN_DIR/traffic"
+        traffic_ipt -N vap_traffic_tx 2>/dev/null || traffic_ipt -nL vap_traffic_tx >/dev/null 2>&1 || exit 1
+        traffic_ipt -N vap_traffic_rx 2>/dev/null || traffic_ipt -nL vap_traffic_rx >/dev/null 2>&1 || exit 1
+        traffic_ipt -C FORWARD -i "$AP_IFACE" -j vap_traffic_tx 2>/dev/null || traffic_ipt -I FORWARD -i "$AP_IFACE" -j vap_traffic_tx || exit 1
+        traffic_ipt -C FORWARD -o "$AP_IFACE" -j vap_traffic_rx 2>/dev/null || traffic_ipt -I FORWARD -o "$AP_IFACE" -j vap_traffic_rx || exit 1
+        : > "$RUN_DIR/traffic/ready"
+    ) 9>"$RUN_DIR/traffic.lock"
+}
+
+traffic_bind() {
+    local mac ip
+    mac=$($PRINTF '%s' "$1" | $TR 'A-F' 'a-f'); ip="$2"
+    traffic_valid_mac "$mac" && traffic_valid_ip "$ip" || return 1
+    [ -f "$RUN_DIR/traffic/ready" ] || return 1
+    [ "$($CAT "$RUN_DIR/traffic/$ip" 2>/dev/null)" = "$mac" ] && return 0
+    (
+        $FLOCK -x 9 || exit 1
+        [ -f "$RUN_DIR/traffic/ready" ] || exit 1
+        local key old oldkey direction
+        key=$($PRINTF '%s' "$mac" | $TR -d ':')
+        old=$($CAT "$RUN_DIR/traffic/$ip" 2>/dev/null)
+        [ "$old" = "$mac" ] && exit 0
+        for direction in tx rx; do
+            traffic_ipt -N "vap_${direction}_$key" 2>/dev/null || true
+            traffic_ipt -C "vap_${direction}_$key" -j RETURN 2>/dev/null || traffic_ipt -A "vap_${direction}_$key" -j RETURN || exit 1
+        done
+        # A DHCP address can be reassigned. The old owner's accumulated bytes
+        # stay in its MAC chain, while the new owner gets an independent counter.
+        if traffic_valid_mac "$old"; then
+            oldkey=$($PRINTF '%s' "$old" | $TR -d ':')
+            while traffic_ipt -D vap_traffic_tx -s "$ip" -j "vap_tx_$oldkey" 2>/dev/null; do :; done
+            while traffic_ipt -D vap_traffic_rx -d "$ip" -j "vap_rx_$oldkey" 2>/dev/null; do :; done
+        fi
+        while traffic_ipt -D vap_traffic_tx -s "$ip" -j "vap_tx_$key" 2>/dev/null; do :; done
+        while traffic_ipt -D vap_traffic_rx -d "$ip" -j "vap_rx_$key" 2>/dev/null; do :; done
+        traffic_ipt -A vap_traffic_tx -s "$ip" -j "vap_tx_$key" || exit 1
+        if ! traffic_ipt -A vap_traffic_rx -d "$ip" -j "vap_rx_$key"; then
+            traffic_ipt -D vap_traffic_tx -s "$ip" -j "vap_tx_$key" 2>/dev/null
+            exit 1
+        fi
+        $PRINTF '%s\n' "$mac" > "$RUN_DIR/traffic/$ip"
+    ) 9>"$RUN_DIR/traffic.lock"
+}
+
+traffic_unbind() {
+    local mac ip
+    mac=$($PRINTF '%s' "$1" | $TR 'A-F' 'a-f'); ip="$2"
+    traffic_valid_mac "$mac" && traffic_valid_ip "$ip" || return 1
+    (
+        $FLOCK -x 9 || exit 1
+        [ "$($CAT "$RUN_DIR/traffic/$ip" 2>/dev/null)" = "$mac" ] || exit 0
+        local key
+        key=$($PRINTF '%s' "$mac" | $TR -d ':')
+        while traffic_ipt -D vap_traffic_tx -s "$ip" -j "vap_tx_$key" 2>/dev/null; do :; done
+        while traffic_ipt -D vap_traffic_rx -d "$ip" -j "vap_rx_$key" 2>/dev/null; do :; done
+        $RM -f "$RUN_DIR/traffic/$ip"
+    ) 9>"$RUN_DIR/traffic.lock"
+}
+
+traffic_dump() {
+    [ -f "$RUN_DIR/traffic/ready" ] || return 0
+    traffic_ipt -nvxL 2>/dev/null | $AWK '
+        /^Chain / {
+            key = ""
+            if ($2 ~ /^vap_(tx|rx)_[0-9a-f]+$/ && length($2) == 19) {
+                split($2, p, "_"); direction = p[2]; key = p[3]
+            }
+            next
+        }
+        key != "" && $3 == "RETURN" && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {
+            print direction, key, $2
+        }'
+}
+
+traffic_clear() {
+    (
+        $FLOCK -x 9 || exit 1
+        $RM -f "$RUN_DIR/traffic/ready"
+        while traffic_ipt -D FORWARD -i "$AP_IFACE" -j vap_traffic_tx 2>/dev/null; do :; done
+        while traffic_ipt -D FORWARD -o "$AP_IFACE" -j vap_traffic_rx 2>/dev/null; do :; done
+        traffic_ipt -F vap_traffic_tx 2>/dev/null
+        traffic_ipt -F vap_traffic_rx 2>/dev/null
+        traffic_ipt -X vap_traffic_tx 2>/dev/null
+        traffic_ipt -X vap_traffic_rx 2>/dev/null
+        traffic_ipt -S 2>/dev/null | $AWK '$1 == "-N" && $2 ~ /^vap_(tx|rx)_[0-9a-f]+$/ && length($2) == 19 { print $2 }' | while IFS= read -r chain; do
+            traffic_ipt -F "$chain" 2>/dev/null
+            traffic_ipt -X "$chain" 2>/dev/null
+        done
+        $RM -rf "$RUN_DIR/traffic"
+    ) 9>"$RUN_DIR/traffic.lock"
+}
+
+cmd_traffic_lease() {
+    case "$1" in
+        add|old) traffic_bind "$2" "$3" ;;
+        del) traffic_unbind "$2" "$3" ;;
+    esac
+    # A failed optional meter must never prevent dnsmasq from serving DHCP.
+    return 0
+}
+
 teardown() {
     log "Bringing down $AP_IFACE and reverting settings..."
 
     stop_daemons
+    traffic_clear
 
     # Policy rules - delete by pinned priority until none remain
     while "$IP" rule del pref "$PRIO_FROM_AP" 2>/dev/null; do :; done
@@ -802,6 +931,12 @@ server=$clean_dns"
         dns_config="resolv-file=$RUN_DIR/resolv.conf"
     fi
 
+    $CAT > "$RUN_DIR/traffic-lease" <<EOF
+#!/system/bin/sh
+exec /system/bin/sh '$(sq "$0")' traffic-lease "\$@"
+EOF
+    "$BUSYBOX" chmod 700 "$RUN_DIR/traffic-lease"
+
     $CAT > "$RUN_DIR/dnsmasq.conf" <<EOF
 interface=$AP_IFACE
 bind-interfaces
@@ -811,6 +946,7 @@ dhcp-range=$IP_BEGIN,$IP_END,12h
 dhcp-option=option:router,$IP_GW
 dhcp-option=option:dns-server,$IP_GW
 dhcp-leasefile=$RUN_DIR/dnsmasq.leases
+dhcp-script=$RUN_DIR/traffic-lease
 $dns_config
 no-hosts
 pid-file=$RUN_DIR/dnsmasq.pid
@@ -991,6 +1127,7 @@ teardown_bridged() {
 
     # Stop hostapd (releases ap0 from the bridge), then delete ap0.
     stop_daemons
+    traffic_clear
     "$IW" dev "$AP_IFACE" del 2>/dev/null || "$IP" link del "$AP_IFACE" 2>/dev/null || true
 
     # Delete host bridge + veth (busybox ip). This also removes VAP_PORT inside
@@ -1052,6 +1189,7 @@ cmd_start() {
         if $GREP -q '^mode=bridged' "$STATE_FILE"; then teardown_bridged; else teardown; fi
     fi
     stop_daemons
+    traffic_clear
 
     check_prerequisites || exit 1
 
@@ -1083,6 +1221,7 @@ cmd_start() {
         trap 'teardown; exit 1' INT TERM
 
         if ! config_network; then teardown; exit 1; fi
+        traffic_init || warn "Per-device traffic accounting could not be initialized; radio counters will be used."
         if ! start_services; then teardown; exit 1; fi
 
         log "VirtualAP is ACTIVE!"
@@ -1113,7 +1252,7 @@ cmd_stop() {
 }
 
 cmd_status() {
-    local running=0 hostapd_state="dead" dnsmasq_state="dead" clients=0 mode="routed" width="" client_data=""
+    local running=0 hostapd_state="dead" dnsmasq_state="dead" clients=0 mode="routed" width="" client_data="" connected="" lease_data="" ap_mac=""
     [ -f "$STATE_FILE" ] && $GREP -q '^mode=bridged' "$STATE_FILE" && mode="bridged"
 
     if [ -f "$STATE_FILE" ]; then
@@ -1127,7 +1266,14 @@ cmd_status() {
         # hostapd's own list, not the driver's: MediaTek's gen4m has no
         # dump_station, so `iw station dump` is always empty there.
         client_data=$(hostapd_cli -p "$RUN_DIR/hostapd" -i "$AP_IFACE" all_sta 2>/dev/null)
-        clients=$($PRINTF '%s\n' "$client_data" | $GREP -cE '^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$')
+        ap_mac=$($CAT "/sys/class/net/$AP_IFACE/address" 2>/dev/null)
+        connected=$($PRINTF '%s\n' "$client_data" | $AWK -v self="$ap_mac" '
+            /^[[:xdigit:]:]+$/ {
+                mac = tolower($0)
+                if (length(mac) != 17 || mac == "00:00:00:00:00:00" || mac == tolower(self) || index("02468ace", substr(mac, 2, 1)) == 0) mac = ""
+            }
+            /^flags=/ && mac != "" && index($0, "[ASSOC]") && index($0, "[AUTHORIZED]") { print mac; mac = "" }')
+        clients=$($PRINTF '%s\n' "$connected" | $GREP -c ':')
     fi
 
     $ECHO "running=$running"
@@ -1135,6 +1281,7 @@ cmd_status() {
     $ECHO "hostapd=$hostapd_state"
     $ECHO "dnsmasq=$dnsmasq_state"
     $ECHO "clients=$clients"
+    $ECHO "ap_mac=$ap_mac"
     # Actual channel width, read live from the radio (iw) so it reflects any
     # firmware downgrade - FullMAC same-channel concurrency can force 20MHz
     # regardless of what hostapd.conf requested. Fall back to the conf only when
@@ -1164,18 +1311,33 @@ cmd_status() {
         $ECHO "gateway=$IP_GW"
     fi
     if [ "$running" = "1" ]; then
+        if [ "$mode" = "bridged" ]; then
+            lease_data=$(ds_run sh -c 'cat /tmp/dhcp.leases /var/lib/misc/dnsmasq.leases 2>/dev/null')
+        else
+            lease_data=$($CAT "$RUN_DIR/dnsmasq.leases" 2>/dev/null)
+            if traffic_init >/dev/null 2>&1; then
+                # Also handles an APK update while the existing hotspot stays on.
+                $PRINTF '%s\n' "$lease_data" | while read -r expiry mac ip rest; do
+                    mac=$($PRINTF '%s' "$mac" | $TR 'A-F' 'a-f')
+                    $PRINTF '%s\n' "$connected" | $GREP -Fxq "$mac" || continue
+                    traffic_bind "$mac" "$ip" >/dev/null 2>&1
+                done
+                "$IP" -4 neigh show dev "$AP_IFACE" 2>/dev/null | $AWK '{ for (i = 1; i < NF; i++) if ($i == "lladdr") print $1, $(i + 1) }' | while read -r ip mac; do
+                    $PRINTF '%s\n' "$connected" | $GREP -Fxq "$mac" || continue
+                    traffic_bind "$mac" "$ip" >/dev/null 2>&1
+                done
+            fi
+        fi
         $ECHO '[stations]'
         $PRINTF '%s\n' "$client_data"
+        $ECHO '[connected]'
+        $PRINTF '%s\n' "$connected"
         $ECHO '[driver]'
-        # Some FullMAC drivers expose counters through only one of these APIs.
-        # Read the radio directly, so both IPv4 and IPv6 work without packet capture.
         "$IW" dev "$AP_IFACE" station dump 2>/dev/null
         $ECHO '[leases]'
-        if [ "$mode" = "bridged" ]; then
-            ds_run sh -c 'cat /tmp/dhcp.leases /var/lib/misc/dnsmasq.leases 2>/dev/null'
-        else
-            $CAT "$RUN_DIR/dnsmasq.leases" 2>/dev/null
-        fi
+        $PRINTF '%s\n' "$lease_data"
+        $ECHO '[accounting]'
+        [ "$mode" != "bridged" ] && traffic_dump
         $ECHO '[end_clients]'
     fi
 }
@@ -1286,6 +1448,7 @@ case "$COMMAND" in
     start)      cmd_start ;;
     stop)       cmd_stop ;;
     status)     cmd_status ;;
+    traffic-lease) cmd_traffic_lease "$@" ;;
     leases)     cmd_leases ;;
     interfaces) cmd_interfaces ;;
     containers) cmd_containers ;;
