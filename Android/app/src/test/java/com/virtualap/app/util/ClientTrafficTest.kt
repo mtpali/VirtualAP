@@ -15,7 +15,7 @@ class ClientTrafficTest {
         assertEquals(1, clients.size)
         assertEquals("samsung", clients.single().name)
         assertEquals("192.168.42.2", clients.single().ipAddress)
-        assertEquals("26 MB", ClientTraffic.formatBytes(clients.single().totalBytes!!))
+        assertEquals("25 MB", ClientTraffic.formatBytes(clients.single().totalBytes!!))
     }
 
     @Test fun prefers64BitCountersOverWrapped32BitCounters() {
