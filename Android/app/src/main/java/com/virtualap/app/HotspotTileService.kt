@@ -1,5 +1,6 @@
 package com.virtualap.app
 
+import android.annotation.SuppressLint
 import android.app.PendingIntent
 import android.content.Intent
 import android.os.Build
@@ -63,6 +64,9 @@ class HotspotTileService : TileService() {
         tile.updateTile()
     }
 
+    // The PendingIntent overload exists only on API 34+. The guarded Intent
+    // overload is still required on supported Android 8 through Android 13 phones.
+    @SuppressLint("StartActivityAndCollapseDeprecated")
     private fun openApp() {
         val intent = Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
