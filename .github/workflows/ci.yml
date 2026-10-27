@@ -32,16 +32,23 @@ jobs:
 
   traffic:
     name: Kernel traffic accounting regression
-    runs-on: ubuntu-latest
+    needs: [binaries]
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 5
     steps:
     - uses: actions/checkout@v4
-    - name: Install BusyBox for Android shell compatibility
-      run: sudo apt-get update -qq && sudo apt-get install -y busybox
-    - name: Exercise real packet counters in isolated network namespaces
+    - uses: actions/download-artifact@v4
+      with:
+        name: bin-aarch64
+        path: backend/aarch64
+    - name: Exercise real packet counters with the APK's BusyBox
       run: |
-        busybox sh -n backend/start-ap
-        sudo env RUN_NETFILTER_TESTS=1 TEST_FLOCK="busybox flock" python3 -m unittest discover -s tests -p test_traffic_kernel.py -v
+        chmod +x backend/aarch64/busybox
+        backend/aarch64/busybox sh -n backend/start-ap
+        sudo env RUN_NETFILTER_TESTS=1 \
+          TEST_FLOCK="$PWD/backend/aarch64/busybox flock" \
+          TEST_SHELL="$PWD/backend/aarch64/busybox sh" \
+          python3 -m unittest discover -s tests -p test_traffic_kernel.py -v
 
   binaries:
     name: Static binaries (${{ matrix.arch }})

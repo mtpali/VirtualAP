@@ -1,6 +1,7 @@
 """Verify accounting with real kernel counters and TCP transfers in isolated namespaces."""
 from pathlib import Path
 import os
+import shlex
 import subprocess
 import tempfile
 import time
@@ -79,7 +80,10 @@ RM=rm
 
     @classmethod
     def cmd(cls, *args):
-        return subprocess.run(args, check=True, text=True, capture_output=True).stdout
+        result = subprocess.run(args, text=True, capture_output=True)
+        if result.returncode:
+            raise RuntimeError(f"{args!r} failed: {result.stderr}\n{result.stdout}")
+        return result.stdout
 
     @classmethod
     def cleanup(cls):
@@ -91,8 +95,12 @@ RM=rm
         cls.directory.cleanup()
 
     def meter(self, *args, check=True):
-        return subprocess.run(['sh', self.harness, *args], env=dict(os.environ, TEST_DIR=str(self.path)),
-            check=check, capture_output=True, text=True)
+        shell = shlex.split(os.environ.get('TEST_SHELL', 'sh'))
+        result = subprocess.run([*shell, self.harness, *args], env=dict(os.environ, TEST_DIR=str(self.path)),
+            capture_output=True, text=True)
+        if check and result.returncode:
+            self.fail(f"Meter {args!r} failed: {result.stderr}\n{result.stdout}")
+        return result
 
     def read_counters(self):
         return {(direction, mac): int(value) for direction, mac, value in
